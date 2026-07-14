@@ -88,20 +88,73 @@ def build_blocked(num_lectures: int, questions_per_sheet: int) -> Schedule:
 MAX_EXTRA_PER_SHEET = 2   # target cap on folded problems added to a sheet
 
 
-def _gradual_profile(n: int, q: int) -> List[int]:
+def new_topic_minimum(q: int) -> int:
+    """Minimum number of questions on a sheet's newly-introduced topic.
+
+    Follows a max(Q - 3, 1) rule: 1 for small sheets (Q <= 4, which stay
+    fully interleaved) and growing for larger sheets (Q = 5 -> 2, Q = 6 -> 3),
+    so bigger problem sheets front-load more practice of the fresh topic.
+    """
+    return max(q - 3, 1)
+
+
+def natural_sheet(topic: int, problem: int, new_min: int) -> int:
+    """Sheet a problem sits on before any fitting/folding.
+
+    The first `new_min` problems of a topic are front-loaded onto its own
+    introducing sheet (sheet t); the remaining problems are spread one per
+    sheet across the following sheets. With new_min = 1 this reduces to the
+    plain interleaved rule t + p - 1.
+    """
+    if problem <= new_min:
+        return topic
+    return topic + (problem - new_min)
+
+
+def _arrange_sheet(problems: List[Problem]) -> List[Problem]:
+    """Order the questions on one interleaved sheet so that questions on the
+    same topic are not listed sequentially where possible.
+
+    Any topic with several questions on the sheet (in particular the
+    front-loaded new topic) is spaced out and interspersed with the revision
+    questions, using the standard "most-remaining, not the same as last"
+    greedy. Each topic's own questions stay in problem-number order, and ties
+    are broken towards the lowest problem number for a natural reading. For a
+    sheet with one question per topic this reduces to the plain p1, p2, ...
+    ordering.
+    """
+    by_topic: dict = {}
+    for (t, p) in sorted(problems, key=lambda tp: (tp[0], tp[1])):
+        by_topic.setdefault(t, []).append(p)
+
+    result: List[Problem] = []
+    last_t = None
+    while len(result) < len(problems):
+        available = [t for t in by_topic if by_topic[t]]
+        pool = [t for t in available if t != last_t] or available
+        # most questions remaining; then lowest next problem number, then topic
+        t = max(pool, key=lambda t: (len(by_topic[t]), -by_topic[t][0], -t))
+        result.append((t, by_topic[t].pop(0)))
+        last_t = t
+    return result
+
+
+def _gradual_profile(n: int, q: int, m: int) -> List[int]:
     """Return a per-sheet target problem-count that rises smoothly.
 
-    Start from the natural interleaved load min(k, Q) -- the ramp-up 1, 2,
-    ..., Q at the start and a flat Q thereafter -- then add the surplus
-    Q(Q-1)/2 (the problems that would otherwise spill past the course) as +1
+    Start from the natural interleaved load min(m - 1 + k, Q) -- a ramp-up of
+    m, m+1, ..., Q at the start (each introducing sheet already carries m
+    questions on its new topic) and a flat Q thereafter -- then add the
+    surplus (the problems that would otherwise spill past the course) as +1
     bumps applied to the LATER sheets first. The result is a non-decreasing
     "staircase" such as 1, 2, 3, 3, 3, 3, 4, 4, 4 that eases up to its peak
     rather than jumping at the very end.
     """
-    target = [min(k, q) for k in range(1, n + 1)]
+    target = [min(m - 1 + k, q) for k in range(1, n + 1)]
     surplus = n * q - sum(target)
-    # Sheets eligible for a bump: the flat region [q, n], latest first.
-    region = list(range(n, q - 1, -1)) or list(range(n, 0, -1))
+    # Sheets eligible for a bump: the flat plateau (target == Q), latest first.
+    region = [k for k in range(n, 0, -1) if target[k - 1] == q] \
+        or list(range(n, 0, -1))
     i = 0
     while surplus > 0:
         target[region[i % len(region)] - 1] += 1
@@ -110,16 +163,17 @@ def _gradual_profile(n: int, q: int) -> List[int]:
     return target
 
 
-def _place_to_profile(n: int, q: int, target: List[int]):
+def _place_to_profile(n: int, q: int, target: List[int], m: int):
     """Assign every problem to a sheet so the per-sheet counts match `target`.
 
-    Keeps each topic's problems in order, never places a problem before its
-    topic's lecture (sheet >= t), and prefers one problem per topic per sheet
-    (interleaving). A topic is only clustered (more than one of its problems
-    on a sheet) when it is forced -- i.e. a late topic with too few sheets
-    left to spread its problems -- which is exactly what lets the tail grow
-    gradually. Returns (sheets, folded) where `folded` are the problems that
-    ended up somewhere other than their natural sheet (t + p - 1).
+    Each introducing sheet is front-loaded with up to `m` problems of its own
+    newly-introduced topic (the max(Q-3,1) new-topic minimum). Beyond that,
+    each topic's problems stay in order, no problem is placed before its
+    topic's lecture (sheet >= t), and one problem per topic per sheet is
+    preferred (interleaving). A topic is only clustered further when forced --
+    a late topic with too few sheets left to spread -- which is what lets the
+    tail grow gradually. Returns (sheets, folded) where `folded` are the
+    problems that ended up somewhere other than their natural sheet.
     """
     remaining = {t: q for t in range(1, n + 1)}
     next_p = {t: 1 for t in range(1, n + 1)}
@@ -128,6 +182,16 @@ def _place_to_profile(n: int, q: int, target: List[int]):
     for k in range(1, n + 1):
         slots = target[k - 1]
         placed_here: Set[int] = set()
+
+        # Front-load up to m problems of the topic introduced on this sheet.
+        take = min(m, remaining[k], slots)
+        for _ in range(take):
+            sheets[k - 1].append((k, next_p[k]))
+            next_p[k] += 1
+            remaining[k] -= 1
+            slots -= 1
+        if take:
+            placed_here.add(k)
 
         # Forced: a topic with more problems left than sheets remaining after
         # this one must place the excess now (clustering).
@@ -160,11 +224,10 @@ def _place_to_profile(n: int, q: int, target: List[int]):
     folded: Set[Problem] = set()
     ordered: List[List[Problem]] = []
     for k in range(1, n + 1):
-        row = sorted(sheets[k - 1], key=lambda tp: (tp[1], tp[0]))
-        for (t, p) in row:
-            if k != t + p - 1:
+        for (t, p) in sheets[k - 1]:
+            if k != natural_sheet(t, p, m):
                 folded.add((t, p))
-        ordered.append(row)
+        ordered.append(_arrange_sheet(sheets[k - 1]))
     return ordered, folded
 
 
@@ -172,14 +235,16 @@ def build_interleaved(num_lectures: int, questions_per_sheet: int,
                       fit_within_course: bool = True,
                       tail: str = "gradual") -> Schedule:
     """
-    One problem per topic per sheet; a topic's Q problems are spread over
-    consecutive sheets:
+    A topic's Q problems are spread across sheets, but each sheet carries at
+    least max(Q-3, 1) questions on the topic its own lecture just introduced
+    (the "new-topic minimum", see `new_topic_minimum`). Those front-loaded
+    problems sit on the introducing sheet; the rest are spread one per sheet
+    across the following sheets (see `natural_sheet`). For Q <= 4 the minimum
+    is 1 and this is the plain interleaved rule t + p - 1.
 
-        topic t, problem p  ->  natural sheet (t + p - 1)
-
-    With fit_within_course=False, the schedule spills onto Q-1 extra "tail"
-    sheets beyond the course (num_lectures + Q - 1 sheets total); every sheet
-    then holds at most Q problems. (`tail` is ignored in this case.)
+    With fit_within_course=False, the schedule spills onto extra "tail" sheets
+    beyond the course; every sheet then holds at most Q problems. (`tail` is
+    ignored in this case.)
 
     When fit_within_course=True, `tail` controls how the schedule is packed
     into the course's `num_lectures` sheets:
@@ -202,19 +267,20 @@ def build_interleaved(num_lectures: int, questions_per_sheet: int,
     """
     q = questions_per_sheet
     n = num_lectures
+    m = new_topic_minimum(q)
 
     if not fit_within_course:
-        n_sheets = n + q - 1
+        n_sheets = n + (q - m)
         buckets: List[List[Problem]] = [[] for _ in range(n_sheets)]
         for t in range(1, n + 1):
             for p in range(1, q + 1):
-                buckets[t + p - 2].append((t, p))
-        sheets = [sorted(b, key=lambda tp: (tp[1], tp[0])) for b in buckets]
+                buckets[natural_sheet(t, p, m) - 1].append((t, p))
+        sheets = [_arrange_sheet(b) for b in buckets]
         return Schedule(kind="interleaved", sheets=sheets)
 
     if tail == "gradual" and n > q:
-        target = _gradual_profile(n, q)
-        sheets, folded_set = _place_to_profile(n, q, target)
+        target = _gradual_profile(n, q, m)
+        sheets, folded_set = _place_to_profile(n, q, target, m)
         return Schedule(kind="interleaved", sheets=sheets, folded=folded_set)
 
     # --- fitted schedule (concentrated tail) ------------------------------
@@ -222,7 +288,7 @@ def build_interleaved(num_lectures: int, questions_per_sheet: int,
     spillover: List[Problem] = []
     for t in range(1, n + 1):
         for p in range(1, q + 1):
-            j = t + p - 1                                  # natural sheet
+            j = natural_sheet(t, p, m)                     # natural sheet
             if j <= n:
                 base[j - 1].append((t, p))
             else:
@@ -252,9 +318,7 @@ def build_interleaved(num_lectures: int, questions_per_sheet: int,
 
     sheets = []
     for s in range(n):
-        row = (sorted(base[s], key=lambda tp: (tp[1], tp[0])) +
-               sorted(fold[s], key=lambda tp: (tp[1], tp[0])))
-        sheets.append(row)
+        sheets.append(_arrange_sheet(base[s] + fold[s]))
     return Schedule(kind="interleaved", sheets=sheets, folded=folded_set)
 
 
